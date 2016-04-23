@@ -1,15 +1,19 @@
+# CS6475 Final Project - Spring 2016
 # Chris Gearhart
 
 import argparse
 import logging
 import os
-import sys
 
-from sys import path
 from glob import glob
+from collections import OrderedDict
 
 import cv2
 import numpy as np
+
+from gco_python.pygco import cut_simple
+from skimage.morphology import disk
+from scipy import optimize
 
 
 LEVELS = [logging.CRITICAL, logging.ERROR, logging.WARNING,
@@ -21,15 +25,30 @@ logging.basicConfig(format=FORMAT)
 log = logging.getLogger()
 
 
-def save_images(stack, prefix, norm=False):
+def save_images(stack, prefix, ext=".png", norm=False, dest=os.getcwd()):
+
+    if not os.path.exists(dest):
+        os.makedirs(dest)
 
     if norm:
-        stack = [x / np.max(x) * 255 for x in stack]
+        stack = map(norm_img, stack)
 
-    log.debug("Saving files: {}".format(prefix))
+    log.debug("Saving files: {}".format(dest))
 
     for idx, img in enumerate(stack):
-        cv2.imwrite(prefix + '{}.png'.format(idx), img)
+        cv2.imwrite(os.path.join(dest, prefix + '{}.png'.format(idx)), img)
+
+
+def norm_img(img):
+    _img = img.astype(np.float32)
+    i_min, i_max = np.min(_img), np.max(_img)
+    return ((img - i_min) / (i_max - i_min) * 255.0).astype(np.uint8)
+
+
+def norm_limits(img, lo, hi):
+    _img = img.astype(np.float32)
+    i_min, i_max = np.min(_img), np.max(_img)
+    return ((_img - i_min) / (i_max - i_min) * (hi - lo)) + lo
 
 
 def read_images(filepattern):
@@ -53,6 +72,8 @@ def align(image_stack):
     Align the image stack with rigid affine transforms between frames
     """
 
+    log.info("Aligning images with rigid transform.")
+
     _stack = [image_stack[0]]
     (r, c) = image_stack[0].shape[:2]
     corners = np.array([[0., c], [0., r], [1., 1.]], dtype=np.float)
@@ -72,120 +93,197 @@ def align(image_stack):
         nw_corner = np.max([nw_corner, bounds[:, 0]], axis=0)
         se_corner = np.min([se_corner, bounds[:, 1]], axis=0)
 
-        log.debug("\n" + str(transform))
+        log.debug("Transformation matrix:\n" + str(transform))
 
     lx, ly = nw_corner[:2]
     rx, ry = se_corner[:2]
 
     _stack = [img[ly:ry, lx:rx] for img in _stack]
 
-    # DEBUG SAVE THE IMAGES
-    save_images(_stack, "aligned")
-
-    return _stack
+    return _stack, _stack[0].shape
 
 
-def piecewiseBilteral(I, L, sigmaS, sigmaR):
-    """
-    I - intensity image (original bw image)
-    L - label image (label number * max_laplacian)
-    sigmaS - spacial standard deviation
-    sigmaR - intensity standard deviation
-    """
-
-    J = np.zeros(I.shape, dtype=np.float)
-    minI, maxI = np.min(I), np.max(I)
-    NB_SEGMENTS = (maxI - minI) / sigmaR
-    SQRT_2PI = np.sqrt(2 * np.pi)
-
-    log.debug("Bilateral interpolation...")
-    log.debug("min/max {}/{}".format(minI, maxI))
-    log.debug("Segments: {}".format(NB_SEGMENTS))
-
-    def g(x, s):
-        return np.exp(-(x * x) / (2 * s * s)) / (s * SQRT_2PI)
-
-    for j in np.arange(NB_SEGMENTS):
-
-        ij = minI + (j * sigmaR)
-        Gj = g(I - ij, sigmaR)
-        Kj = cv2.GaussianBlur(Gj, (0, 0), sigmaS)
-        Hj = cv2.GaussianBlur(Gj * L, (0, 0), sigmaS)
-
-        # temporarily disable divide-by-zero warnings and
-        # invalid value warnings -- values from those locations
-        # in K are ignored
-        with np.errstate(divide='ignore', invalid='ignore'):
-            Jj = np.where((Kj > 0), Hj / Kj, 0)
-
-        # linear interpolation based on equation (1) in:
-        # http://www.ee.cuhk.edu.hk/~tblu/monsite/pdfs/blu0401.pdf
-        dist = np.abs((I - ij) / sigmaR)
-        hat_weights = np.where(dist <= 1, 1 - dist, 0)
-        J += (Jj * hat_weights)
-
-    return J
-
-
-def interpolate_depth(depth_pixels, images, params):
+def all_in_focus(images):
     """
     """
-    # Given an image with some known pixel depths, interpolate the
-    # most likely distance of unknown pixels using bilinear interpolation
-    # from the source images.
-    # The depth pixels should be concentrated along edges in the source
-    # images, so interpolating from those depths using a bilateral filter
-    # on the focal stack will spread the distance estimate based on the
-    # visual similarity of the surrounding scene.
-    pass
+    log.info("Generating all-in-focus image.")
+
+    # unary scaling factor to convert from float32 -> int32
+    # pair scaling factor performs conversion and discounts mismatches
+    unary_scale = 2**22
+    pair_scale = 2**8
+
+    log.debug("Unary scaling factor: {}".format(unary_scale))
+    log.debug("Pairwise scaling factor: {}".format(pair_scale))
+
+    n = len(images)
+
+    unary = []
+    for idx, img in enumerate(images):
+        _img = img.astype(np.float32) / 255.
+        grad = np.exp(-(cv2.Sobel(_img, cv2.CV_32F, 1, 1)**2))
+        unary.append(cv2.GaussianBlur(grad, (13, 13), 0) * unary_scale)
+
+    unary = np.stack([x.astype(np.int32) for x in unary], axis=-1)
+    unary = (unary - np.min(unary))
+
+    ii, jj = np.meshgrid(range(n), range(n))
+    pairwise = np.abs(4*ii - 4*jj).astype(np.int32) * pair_scale
+
+    graph_img = cut_simple(unary, pairwise, n_iter=20)
+
+    aif_img = np.sum([np.where(i == graph_img, images[i], 0)
+                     for i in range(n)], axis=0, dtype=np.float64)
+
+    return graph_img, aif_img
 
 
-def main(images):
+def generate_blur_stack(_img, num_steps=26, size=0.25):
     """
     """
-    # pipeline:
-    # - convert to BW
-    # - align then crop focal stack - (at least pairwise with anchor,
-    #     better in parallel)
-    # - calculate gradients
-    # - for each pixel, determine the gradient strength as a function
-    #     of focal stack index and use maximal selection to choose the
-    #     pixels that are candidates for focal boundaries
-    # - build an image for each focal plane with the maximal pixels
-    #     activate and apply a large gaussian gradient to build a weight
-    #     matrix for each image in the focal stack
-    # - interpolate between layers using the combined weight of the
-    #     focal stacks
+    log.info("Generating blur stack in range 0.75-{}."
+             .format(0.75 + num_steps * size))
 
-    # gradient depends on intensity, not color planes
-    bw_images = [cv2.cvtColor(x, cv2.COLOR_BGR2GRAY) for x in images]
+    disks = OrderedDict()
+    for i in range(num_steps):
+        d = disk(0.75 + i * size, dtype=np.float64)
+        if d.size % 2 == 0:
+            continue
+        disks[(np.sum(d), d.size)] = d / max(np.sum(d), 1)
 
+    blur_stack = [cv2.filter2D(_img, cv2.CV_64F, d,
+                  borderType=cv2.BORDER_REFLECT) for d in disks.values()]
+
+    return blur_stack
+
+
+def estimate_focal_depths(img_stack, blur_stack, s, fi, A=5.0, F=18.0):
+    """
+    """
+    log.info("Solving for focal depth parameters.")
+
+    # parameters from paper
+    alpha = .3
+    B, C = [], []
+    for frame in img_stack:
+        D = [cv2.GaussianBlur(np.abs(frame - b), (15, 15), 0)
+             for b in blur_stack]
+        B.append(np.argmin(D, axis=0) / 2.0)
+        C.append(np.power(np.mean(D, axis=0) - np.min(D, axis=0), alpha))
+
+    max_c = np.max(C)
+    C = [c / max_c for c in C]
+
+    BC = np.array([b * c for b, c in zip(B, C)])
+
+    def f_residuals(x, y, s):
+        A = x[0]
+        F = x[1]
+        fi = x[2:]
+        y_hat = np.concatenate([A * (abs(f - s) / s) * (F / (f - F))
+                                for f in fi])
+        err = y.ravel() - y_hat
+        return err
+
+    x = np.concatenate([[A], [F], fi])
+    sol = optimize.leastsq(f_residuals, x.astype(np.float64),
+                           args=(BC, s.ravel()))
+
+    log.debug("Parameters:\nA: {}\nF: {}\nFocal Depths: {}"
+              .format(sol[0][0], sol[0][1], sol[0][2:]))
+
+    return sol[0], BC, C
+
+
+def graph_interpolate(fi, BC, steps=10, A=5, F=18):
+
+    log.info("Interpolating depth from graph.")
+
+    s_vals = np.linspace(np.min(fi), np.max(fi), num=steps)
+    # unary scaling factor to convert from float64 -> int32
+    # pair scaling factor performs conversion and discounts mismatches
+    unary_scale = 2**23
+    pair_scale = 2**11
+
+    log.debug("Unary scaling factor: {}".format(unary_scale))
+    log.debug("Pairwise scaling factor: {}".format(pair_scale))
+
+    unary = []
+    for idx, s in enumerate(s_vals):
+        err = np.min([(bc - (A * np.abs(f - s) / s) * (F / (f - F)))**2
+                      for (f, bc) in zip(fi, BC)], axis=0)
+        unary.append(err)
+
+    max_u, min_u = np.max(unary), np.min(unary)
+    unary = np.stack([(((u - min_u) / (max_u - min_u)) * unary_scale)
+                      for u in unary], axis=-1)
+
+    ii, jj = np.meshgrid(range(steps), range(steps))
+    pairwise = np.abs(4*ii - 4*jj) * pair_scale
+
+    graph_img = cut_simple(unary.astype(np.int32),
+                           pairwise.astype(np.int32),
+                           n_iter=50)
+    return graph_img
+
+
+def main(images, dest):
+    """
+    """
     # align and crop the images to account for minute magnification
-    # start with homography; try optical flow possibly
-    bw_stack = align(bw_images)
+    bw_images, imshape = align([cv2.cvtColor(x, cv2.COLOR_BGR2GRAY)
+                                for x in images])
+    n = len(bw_images)
+    imshape = bw_images[0].shape
 
-    # calculate the gradient magnitude for all points
-    grad_stack = map(lambda x: np.abs(cv2.Laplacian(x, cv2.CV_64F)), bw_stack)
-    max_vals = np.max(np.array(grad_stack), axis=0)
-    max_grads = [np.where(g == max_vals, g, 0) for g in grad_stack]
+    save_images(bw_images, "aligned", dest=os.path.join(dest, "aligned"))
 
-    save_images(max_grads, "max", norm=True)
+    graph_img, aif_img = all_in_focus(bw_images)
+    save_images([aif_img], "aifimg", dest=os.path.join(dest, "aifimg"))
 
-    sigmaR = 9.
-    sigmaS = 31.
-    label_stack = [piecewiseBilteral(b, w, sigmaS, sigmaR) for b, w in
-                   zip(bw_stack, max_grads)]
-    label_stack = [np.zeros(label_stack[0].shape)] + label_stack
+    # num_steps specified in paper
+    blur_stack = generate_blur_stack(aif_img, num_steps=15, size=.25)
+    save_images(blur_stack, "blur", norm=True, dest=os.path.join(dest, "blur"))
 
-    save_images(label_stack[1:], "labels", norm=True)
+    # initialize parameters for the solver
+    A, F = 5, 18
+    fi = (np.arange(n)*40 + 500).astype(np.float64)
+    s = np.zeros(imshape, dtype=np.float64)
+    for idx, f in enumerate(fi):
+        s[graph_img == idx] = f
 
-    d = np.argmax(label_stack, axis=0)
+    sol, BC, C = estimate_focal_depths(bw_images, blur_stack, s, fi, A=A, F=F)
 
-    print np.min(d), np.max(d)
-    cv2.imwrite('dist.png', d / np.float(np.max(d)) * 255)
+    A, F, fi = sol[0], sol[1], sol[2:]
+    s2 = norm_limits(graph_interpolate(fi, BC, steps=25, A=A, F=F),
+                     np.min(fi), np.max(fi))
 
-    d = d * np.sum(label_stack, axis=0) / 4.
-    cv2.imwrite('dist2.png', d / np.float(np.max(d)) * 255)
+    # laplacian blending shenanigans
+    c = np.max(C, axis=0)
+
+    g, h = s, s2
+    stack = []
+    for _ in range(3):
+        _g, _h, _c = map(cv2.pyrDown, [g, h, c])
+        y, x = g.shape
+        lg = g - cv2.pyrUp(_g)[:y, :x]
+        lh = h - cv2.pyrUp(_h)[:y, :x]
+        blend = (1 - c[:y, :x]) * lg + c[:y, :x] * lh
+        stack.append(blend)
+        g, h, c = _g, _h, _c
+
+    y, x = g.shape
+    stack.append((1 - c[:y, :x]) * g + c[:y, :x] * h)
+
+    res = np.zeros(stack[-1].shape)
+    for img in stack[::-1]:
+        y, x = img.shape
+        res = cv2.pyrUp(res[:y, :x] + img)
+
+    s3 = cv2.pyrDown(res)
+
+    save_images([s, s2, s3], "depthmap", norm=True,
+                dest=os.path.join(dest, "graph"))
 
 
 if __name__ == "__main__":
@@ -198,20 +296,12 @@ if __name__ == "__main__":
                         nargs='?',
                         default="output",
                         help="Directory to write output images")
-    parser.add_argument("-b", "--bilateral",
-                        nargs=2,
-                        default='',
-                        help="")
     parser.add_argument('-e', '--ext',
                         default='*[jgptJGPT][pinPIN][gfGF]*',
                         help='Image filename extension pattern [see fnmatch]')
-    parser.add_argument("-w", "--width",
-                        default=2,
-                        type=int,
-                        help="")
     parser.add_argument("-v", "--verbose",
                         type=int,
-                        default=0,
+                        default=3,
                         choices=[0, 1, 2, 3, 4, 5],
                         help='Logging level [0 - CRITICAL, 5 - ALL]')
     args = parser.parse_args()
@@ -221,5 +311,9 @@ if __name__ == "__main__":
     filepattern = os.path.join(args.source, args.ext)
     images = read_images(filepattern)
 
-    main(images)
-    # main(images, args.dest, args.bilateral, args.width)
+    project = os.path.split(args.source)[-1]
+    abs_path = os.path.join(os.path.abspath(args.dest), project)
+    if not os.path.exists(abs_path):
+        os.makedirs(abs_path)
+
+    main(images, abs_path)
