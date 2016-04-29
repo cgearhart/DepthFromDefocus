@@ -31,7 +31,7 @@ def save_images(stack, prefix, ext=".png", norm=False, dest=os.getcwd()):
         os.makedirs(dest)
 
     if norm:
-        stack = map(norm_img, stack)
+        stack = [norm_limits(s, hi=255).astype(np.uint8) for s in stack]
 
     log.debug("Saving files: {}".format(dest))
 
@@ -39,21 +39,13 @@ def save_images(stack, prefix, ext=".png", norm=False, dest=os.getcwd()):
         cv2.imwrite(os.path.join(dest, prefix + '{}.png'.format(idx)), img)
 
 
-def norm_img(img):
-    _img = img.astype(np.float32)
-    i_min, i_max = np.min(_img), np.max(_img)
-    return ((img - i_min) / (i_max - i_min) * 255.0).astype(np.uint8)
-
-
-def norm_limits(img, lo, hi):
+def norm_limits(img, lo=0, hi=1):
     _img = img.astype(np.float32)
     i_min, i_max = np.min(_img), np.max(_img)
     return ((_img - i_min) / (i_max - i_min) * (hi - lo)) + lo
 
 
 def read_images(filepattern):
-    """
-    """
     log.info("Reading images from {}".format(filepattern))
     log.debug("files: " + ', '.join(glob(filepattern)))
 
@@ -74,13 +66,19 @@ def align(image_stack):
 
     log.info("Aligning images with rigid transform.")
 
-    _stack = [image_stack[0]]
+    # calculate the image corners to auto-crop frames;
+    # only using the northwest and southeast corners can lead to
+    # errors if the other two corners form a smaller bounding box
     (r, c) = image_stack[0].shape[:2]
     corners = np.array([[0., c], [0., r], [1., 1.]], dtype=np.float)
     nw_corner, se_corner = corners[:, 0], corners[:, 1]
-    transform = np.array([[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
-                         dtype=np.float)
 
+    transform = np.eye(3)
+    _stack = [image_stack[0]]
+
+    # iterate over each pair of images and compute the cumulative
+    # rigid transform to project the current frame onto the first
+    # image frame
     for anchor, img in zip(image_stack[:-1], image_stack[1:]):
 
         new_t = cv2.estimateRigidTransform(img, anchor, fullAffine=False)
@@ -103,16 +101,12 @@ def align(image_stack):
     return _stack, _stack[0].shape
 
 
-def all_in_focus(images):
+def all_in_focus(images, unary_scale, pair_scale):
     """
+    Use graph cut optimization to generate an all-in-focus image
+    from an aligned focal stack
     """
     log.info("Generating all-in-focus image.")
-
-    # unary scaling factor to convert from float32 -> int32
-    # pair scaling factor performs conversion and discounts mismatches
-    unary_scale = 2**22
-    pair_scale = 2**8
-
     log.debug("Unary scaling factor: {}".format(unary_scale))
     log.debug("Pairwise scaling factor: {}".format(pair_scale))
 
@@ -122,15 +116,16 @@ def all_in_focus(images):
     for idx, img in enumerate(images):
         _img = img.astype(np.float32) / 255.
         grad = np.exp(-(cv2.Sobel(_img, cv2.CV_32F, 1, 1)**2))
-        unary.append(cv2.GaussianBlur(grad, (13, 13), 0) * unary_scale)
+        unary.append(cv2.GaussianBlur(grad, (9, 9), 0) * unary_scale)
 
-    unary = np.stack([x.astype(np.int32) for x in unary], axis=-1)
-    unary = (unary - np.min(unary))
+    unary = norm_limits(np.stack(unary, axis=-1)) * unary_scale
 
     ii, jj = np.meshgrid(range(n), range(n))
-    pairwise = np.abs(4*ii - 4*jj).astype(np.int32) * pair_scale
+    pairwise = np.abs(ii - jj) * pair_scale
 
-    graph_img = cut_simple(unary, pairwise, n_iter=20)
+    graph_img = cut_simple(unary.astype(np.int32),
+                           pairwise.astype(np.int32),
+                           n_iter=20)
 
     aif_img = np.sum([np.where(i == graph_img, images[i], 0)
                      for i in range(n)], axis=0, dtype=np.float64)
@@ -140,15 +135,24 @@ def all_in_focus(images):
 
 def generate_blur_stack(_img, num_steps=26, size=0.25):
     """
+    Generate a stack of progressively blurred images by applying a
+    progressively larger arithmetic mean point spread function to
+    an all-in-focus image
     """
     log.info("Generating blur stack in range 0.75-{}."
              .format(0.75 + num_steps * size))
 
     disks = OrderedDict()
     for i in range(num_steps):
+
+        # min size disk is 0.75 because smaller disks are all zero
         d = disk(0.75 + i * size, dtype=np.float64)
+
+        # skip steps even size disks because they shift the output
         if d.size % 2 == 0:
             continue
+
+        # prevent duplicate disks to avoid ambiguity in the blur stack
         disks[(np.sum(d), d.size)] = d / max(np.sum(d), 1)
 
     blur_stack = [cv2.filter2D(_img, cv2.CV_64F, d,
@@ -159,27 +163,28 @@ def generate_blur_stack(_img, num_steps=26, size=0.25):
 
 def estimate_focal_depths(img_stack, blur_stack, s, fi, A=5.0, F=18.0):
     """
+    Estimate scene parameters by solving nonlinear least squares using
+    scipy.optimize levenberg-marquardt solver
     """
     log.info("Solving for focal depth parameters.")
 
-    # parameters from paper
-    alpha = .3
+    alpha = .3  # parameter from paper was 2.0
+    width = 11  # parameter from the paper was 13
     B, C = [], []
     for frame in img_stack:
-        D = [cv2.GaussianBlur(np.abs(frame - b), (15, 15), 0)
+        D = [cv2.GaussianBlur(np.abs(frame - b), (width, width), 0)
              for b in blur_stack]
         B.append(np.argmin(D, axis=0) / 2.0)
         C.append(np.power(np.mean(D, axis=0) - np.min(D, axis=0), alpha))
 
+    # confidence is proportional to C, so normalize the scale
     max_c = np.max(C)
     C = [c / max_c for c in C]
 
     BC = np.array([b * c for b, c in zip(B, C)])
 
     def f_residuals(x, y, s):
-        A = x[0]
-        F = x[1]
-        fi = x[2:]
+        A, F, fi = x[0], x[1], x[2:]
         y_hat = np.concatenate([A * (abs(f - s) / s) * (F / (f - F))
                                 for f in fi])
         err = y.ravel() - y_hat
@@ -195,31 +200,27 @@ def estimate_focal_depths(img_stack, blur_stack, s, fi, A=5.0, F=18.0):
     return sol[0], BC, C
 
 
-def graph_interpolate(fi, BC, steps=10, A=5, F=18):
-
+def graph_interpolate(fi, BC, unary_scale, pair_scale, steps=10, A=5, F=18):
+    """
+    Use graph cut optimization to interpolate the depth of each pixel in
+    a scene minimizing a nonlinear least-squares unary energy function and
+    """
     log.info("Interpolating depth from graph.")
-
-    s_vals = np.linspace(np.min(fi), np.max(fi), num=steps)
-    # unary scaling factor to convert from float64 -> int32
-    # pair scaling factor performs conversion and discounts mismatches
-    unary_scale = 2**23
-    pair_scale = 2**11
-
     log.debug("Unary scaling factor: {}".format(unary_scale))
     log.debug("Pairwise scaling factor: {}".format(pair_scale))
 
+    s_vals = np.linspace(np.min(fi), np.max(fi), num=steps)
+
     unary = []
     for idx, s in enumerate(s_vals):
-        err = np.min([(bc - (A * np.abs(f - s) / s) * (F / (f - F)))**2
+        err = np.sum([(bc - (A * np.abs(f - s) / s) * (F / (f - F)))**2
                       for (f, bc) in zip(fi, BC)], axis=0)
         unary.append(err)
 
-    max_u, min_u = np.max(unary), np.min(unary)
-    unary = np.stack([(((u - min_u) / (max_u - min_u)) * unary_scale)
-                      for u in unary], axis=-1)
+    unary = norm_limits(np.stack(unary, axis=-1)) * unary_scale
 
     ii, jj = np.meshgrid(range(steps), range(steps))
-    pairwise = np.abs(4*ii - 4*jj) * pair_scale
+    pairwise = np.abs(ii - jj) * pair_scale
 
     graph_img = cut_simple(unary.astype(np.int32),
                            pairwise.astype(np.int32),
@@ -238,51 +239,37 @@ def main(images, dest):
 
     save_images(bw_images, "aligned", dest=os.path.join(dest, "aligned"))
 
-    graph_img, aif_img = all_in_focus(bw_images)
+    # unary scaling factor to convert from float32 -> int32
+    # pair scaling factor performs conversion and discounts mismatches
+    unary_scale = 2**22
+    pair_scale = 2**12
+    graph_img, aif_img = all_in_focus(bw_images, unary_scale, pair_scale)
     save_images([aif_img], "aifimg", dest=os.path.join(dest, "aifimg"))
 
     # num_steps specified in paper
-    blur_stack = generate_blur_stack(aif_img, num_steps=15, size=.25)
+    blur_stack = generate_blur_stack(aif_img, num_steps=23, size=.25)
     save_images(blur_stack, "blur", norm=True, dest=os.path.join(dest, "blur"))
 
     # initialize parameters for the solver
-    A, F = 5, 18
-    fi = (np.arange(n)*40 + 500).astype(np.float64)
+    A, F = 5, 18  # Aperture diameter and focal length (in mm)
+    fi = (np.arange(n)*40 + 500).astype(np.float64)  # arbitrary values
     s = np.zeros(imshape, dtype=np.float64)
     for idx, f in enumerate(fi):
         s[graph_img == idx] = f
 
     sol, BC, C = estimate_focal_depths(bw_images, blur_stack, s, fi, A=A, F=F)
 
+    # unary scaling factor to convert from float64 -> int32
+    # pair scaling factor performs conversion and discounts mismatches
+    unary_scale = 2**23
+    pair_scale = 2**16
+    color_depth = 128  # arbitrary color depth for the depth map
     A, F, fi = sol[0], sol[1], sol[2:]
-    s2 = norm_limits(graph_interpolate(fi, BC, steps=25, A=A, F=F),
-                     np.min(fi), np.max(fi))
+    s2 = norm_limits(graph_interpolate(fi, BC, unary_scale, pair_scale,
+                     steps=color_depth, A=A, F=F), lo=np.min(fi),
+                     hi=np.max(fi))
 
-    # laplacian blending shenanigans
-    c = np.max(C, axis=0)
-
-    g, h = s, s2
-    stack = []
-    for _ in range(3):
-        _g, _h, _c = map(cv2.pyrDown, [g, h, c])
-        y, x = g.shape
-        lg = g - cv2.pyrUp(_g)[:y, :x]
-        lh = h - cv2.pyrUp(_h)[:y, :x]
-        blend = (1 - c[:y, :x]) * lg + c[:y, :x] * lh
-        stack.append(blend)
-        g, h, c = _g, _h, _c
-
-    y, x = g.shape
-    stack.append((1 - c[:y, :x]) * g + c[:y, :x] * h)
-
-    res = np.zeros(stack[-1].shape)
-    for img in stack[::-1]:
-        y, x = img.shape
-        res = cv2.pyrUp(res[:y, :x] + img)
-
-    s3 = cv2.pyrDown(res)
-
-    save_images([s, s2, s3], "depthmap", norm=True,
+    save_images([s, s2], "depthmap", norm=True,
                 dest=os.path.join(dest, "graph"))
 
 
@@ -303,7 +290,7 @@ if __name__ == "__main__":
                         type=int,
                         default=3,
                         choices=[0, 1, 2, 3, 4, 5],
-                        help='Logging level [0 - CRITICAL, 5 - ALL]')
+                        help='Logging level [0 - CRITICAL, 3 - INFO, 5 - ALL]')
     args = parser.parse_args()
     log.setLevel(LEVELS[args.verbose])
     log.info("Set logging level: {}".format(LEVEL_NAMES[args.verbose]))
